@@ -1,0 +1,28 @@
+from dotenv import load_dotenv
+import os
+
+# Load biến môi trường từ file .env
+load_dotenv()
+
+# Đường dẫn tới các thư mục và file dựa trên cấu hình từ .env
+DATA_DIRECTORY = os.getenv('DATA_DIRECTORY', 'data')
+DB_DIRECTORY = os.getenv('DB_DIRECTORY', 'db')
+LOGS_DIRECTORY = os.getenv('LOGS_DIRECTORY', 'logs')
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'data/news_articles')  # OUTPUT_DIR nằm trong thư mục 'data'
+DB_FILE = os.getenv('DB_FILE', 'news_data.db')
+LOG_FILE = os.getenv('LOG_FILE', 'crawl_log.log')
+TXT_FILE = os.getenv('TXT_FILE', 'news_data.txt')
+
+# Đường dẫn đầy đủ tới cơ sở dữ liệu, file TXT và log
+DB_PATH = os.path.join(DB_DIRECTORY, DB_FILE)
+FILE_PATH = os.path.join(DATA_DIRECTORY, TXT_FILE)
+LOG_PATH = os.path.join(LOGS_DIRECTORY, LOG_FILE)
+
+# Tạo DATABASE_URL cho SQLAlchemy
+DATABASE_URL = f'sqlite:///{DB_PATH}'
+
+# Tạo các thư mục nếu chưa tồn tại
+os.makedirs(DATA_DIRECTORY, exist_ok=True)
+os.makedirs(DB_DIRECTORY, exist_ok=True)
+os.makedirs(LOGS_DIRECTORY, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)  # Tạo thư mục 'news_articles' trong 'data'

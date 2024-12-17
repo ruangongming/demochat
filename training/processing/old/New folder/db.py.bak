@@ -1,0 +1,95 @@
+import shutil
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
+from sqlalchemy.exc import SQLAlchemyError
+from config import DATABASE_URL, DB_PATH, DB_DIRECTORY
+import logging
+import os
+from contextlib import contextmanager
+import hashlib
+
+# Cấu hình logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Khởi tạo SQLAlchemy với SQLite
+Base = declarative_base()
+engine = create_engine(DATABASE_URL)
+Session = scoped_session(sessionmaker(bind=engine))
+
+class News(Base):
+    """Định nghĩa bảng News"""
+    __tablename__ = 'news'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    url_with_index = Column(String, unique=True)  # URL với số thứ tự
+    url = Column(String)  # URL gốc
+    hash = Column(String)
+    title = Column(String)
+    content = Column(String)
+
+def create_hash(url):
+    """Tạo hash SHA256 cho URL"""
+    return hashlib.sha256(url.encode()).hexdigest()
+
+def backup_database():
+    """Sao lưu cơ sở dữ liệu"""
+    if os.path.exists(DB_PATH):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(DB_DIRECTORY, f'news_data_backup_{timestamp}.db')
+        try:
+            shutil.copy(DB_PATH, backup_path)
+            logging.info(f"Database backup created at: {backup_path}")
+        except IOError as e:
+            logging.error(f"Failed to backup database: {e}")
+    else:
+        logging.warning("Database file does not exist for backup.")
+
+def initialize_database():
+    """Kiểm tra và tạo bảng news nếu chưa tồn tại."""
+    try:
+        backup_database()  # Sao lưu trước khi khởi tạo
+        Base.metadata.create_all(engine)
+        logging.info("Database initialized successfully.")
+    except (IOError, SQLAlchemyError) as e:
+        logging.error(f"Error during initialization: {e}")
+
+@contextmanager
+def get_session():
+    """Khởi tạo và trả về phiên giao dịch."""
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except SQLAlchemyError as e:
+        session.rollback()
+        logging.error(f"Session rollback due to: {e}")
+    finally:
+        session.close()
+
+def add_or_update_news_item(url, index, title, content):
+    """Thêm hoặc cập nhật một bản ghi trong bảng news."""
+    url_with_index = f"{url}_{index}"  # Tạo URL kèm số thứ tự
+    with get_session() as session:
+        try:
+            news_item = session.query(News).filter_by(url_with_index=url_with_index).one_or_none()
+            if not news_item:
+                news_item = News(
+                    url_with_index=url_with_index,
+                    url=url,
+                    hash=create_hash(url_with_index),
+                    title=title,
+                    content=content
+                )
+                session.add(news_item)
+                logging.info(f"Added new item: {title}")
+            else:
+                news_item.hash = create_hash(url_with_index)
+                news_item.title = title
+                news_item.content = content
+                logging.info(f"Updated news item: {title}")
+        except SQLAlchemyError as e:
+            logging.error(f"Failed to add or update news item: {e}")
+
+if __name__ == '__main__':
+    initialize_database()

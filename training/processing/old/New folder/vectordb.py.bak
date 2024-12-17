@@ -1,0 +1,195 @@
+import gc
+import os
+import json
+import sqlite3
+import shutil
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import GPT4AllEmbeddings
+from langchain.docstore.document import Document
+
+# Khai báo biến
+PDF_DATA_PATH = os.path.join('data', 'pdf')
+TEXT_DATA_PATH = os.path.join('data', 'news_articles')
+VECTOR_DB_PATH = os.path.join('data', 'vectorstores', 'db_faiss')
+METADATA_PATH = os.path.join('metadata.json')
+DB_DIRECTORY = os.path.join('db')
+DB_PATH = os.path.join(DB_DIRECTORY, 'news_data.db')
+LOG_FILE = os.path.join('logs', 'crawl_log.log')
+
+os.makedirs(DB_DIRECTORY, exist_ok=True)
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+# Cấu hình logging để ghi vào file và console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+
+def load_metadata():
+    """Tải metadata từ file JSON."""
+    if os.path.exists(METADATA_PATH):
+        with open(METADATA_PATH, "r", encoding='utf-8') as f:
+            return json.load(f)
+    else:
+        return {"processed_files": []}
+
+
+def save_metadata(metadata):
+    """Lưu metadata vào file JSON."""
+    with open(METADATA_PATH, "w", encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False)
+
+
+def read_text_file(file_path):
+    """Đọc nội dung của tệp văn bản với xử lý lỗi encoding."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(file_path, 'r', encoding='latin-1') as f:
+            return f.read()
+
+
+def load_documents_from_db():
+    """Tải tất cả các tài liệu từ cơ sở dữ liệu SQLite."""
+    documents = []
+    if os.path.exists(DB_PATH):
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT url, title, content, hash FROM news')
+            rows = cursor.fetchall()
+            for row in rows:
+                documents.append(
+                    Document(page_content=row[2], metadata={'source': row[0], 'title': row[1], 'hash': row[3]}))
+    return documents
+
+
+def load_documents_from_files():
+    """Tải tất cả các tài liệu đã xử lý từ metadata."""
+    documents = []
+    metadata = load_metadata()
+    processed_files = metadata["processed_files"]
+    valid_files = []
+
+    def process_file(file_path):
+        if file_path.endswith('.txt') and os.path.exists(file_path):
+            try:
+                text = read_text_file(file_path)
+                return Document(page_content=text, metadata={'source': file_path})
+            except Exception as e:
+                logging.error(f"Error loading file {file_path}: {e}")
+        elif file_path.endswith('.pdf') and os.path.exists(file_path):
+            try:
+                loader = PyPDFLoader(file_path)
+                return loader.load()
+            except Exception as e:
+                logging.error(f"Error loading file {file_path}: {e}")
+        return None
+
+    with ThreadPoolExecutor() as executor:
+        future_to_file = {executor.submit(process_file, file): file for file in processed_files}
+        for future in as_completed(future_to_file):
+            result = future.result()
+            if result:
+                if isinstance(result, list):
+                    documents.extend(result)
+                else:
+                    documents.append(result)
+                valid_files.append(future_to_file[future])
+
+    # Update metadata to only include valid files
+    metadata["processed_files"] = valid_files
+    save_metadata(metadata)
+
+    return documents
+
+
+def create_db_from_files():
+    """Tạo cơ sở dữ liệu vector từ các tệp PDF và văn bản."""
+    # Load metadata
+    metadata = load_metadata()
+    processed_files = set(metadata["processed_files"])
+
+    # Khai báo loader để quét toàn bộ thư mục dữ liệu
+    pdf_documents = []
+    if os.path.exists(PDF_DATA_PATH):
+        pdf_loader = DirectoryLoader(PDF_DATA_PATH, glob="*.pdf", loader_cls=PyPDFLoader)
+        pdf_documents = [doc for doc in pdf_loader.load() if doc.metadata['source'] not in processed_files]
+    else:
+        logging.info(f"Directory not found: '{PDF_DATA_PATH}' - Skipping PDF documents")
+
+    # Thủ công đọc các tệp văn bản
+    text_documents = []
+    if os.path.exists(TEXT_DATA_PATH):
+        for root, _, files in os.walk(TEXT_DATA_PATH):
+            for file in files:
+                if file.endswith('.txt'):
+                    file_path = os.path.join(root, file)
+                    if file_path not in processed_files and os.path.exists(file_path):
+                        try:
+                            text = read_text_file(file_path)
+                            text_documents.append(Document(page_content=text, metadata={'source': file_path}))
+                        except Exception as e:
+                            logging.error(f"Error loading file {file_path}: {e}")
+    else:
+        logging.info(f"Directory not found: '{TEXT_DATA_PATH}' - Skipping text documents")
+
+    documents = pdf_documents + text_documents
+
+    # Embedding
+    model_name = "all-MiniLM-L6-v2.gguf2.f16.gguf"
+    gpt4all_kwargs = {'allow_download': True}
+    embeddings = GPT4AllEmbeddings(
+        model_name=model_name,
+        gpt4all_kwargs=gpt4all_kwargs
+    )
+
+    if not documents:
+        logging.info("No new documents to process.")
+        # Nếu không có tài liệu mới, load các tài liệu đã tồn tại từ file hoặc database
+        documents = load_documents_from_files() + load_documents_from_db()
+
+    if documents:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+        chunks = text_splitter.split_documents(documents)
+
+        # Create or load existing database
+        if os.path.exists(VECTOR_DB_PATH):
+            db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
+            db.add_documents(chunks)
+            db.save_local(VECTOR_DB_PATH)
+        else:
+            db = FAISS.from_documents(chunks, embeddings)
+            db.save_local(VECTOR_DB_PATH)
+
+        # Update metadata with newly processed files
+        new_processed_files = [doc.metadata['source'] for doc in documents]
+        metadata["processed_files"].extend(new_processed_files)
+        save_metadata(metadata)
+
+    # Nếu db_faiss bị xóa, tạo lại từ các tệp đã xử lý trước đó
+    if not os.path.exists(VECTOR_DB_PATH):
+        documents = load_documents_from_files() + load_documents_from_db()
+        if documents:
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+            chunks = text_splitter.split_documents(documents)
+
+            db = FAISS.from_documents(chunks, embeddings)
+            db.save_local(VECTOR_DB_PATH)
+        else:
+            logging.info("No documents found to recreate vector database.")
+
+
+if __name__ == '__main__':
+    create_db_from_files()
+    gc.collect()  # Explicit garbage collection
